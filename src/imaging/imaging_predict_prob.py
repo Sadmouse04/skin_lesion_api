@@ -8,8 +8,12 @@ from src.utils.utils import assemble_experiment_path
 from src.imaging.imaging_dataset import ImageDataset
 from torch.utils.data import DataLoader
 
+# Create global variables to hold the model in RAM
+_CACHED_MODEL = None
+_CACHED_TRAINER = None
 
 def imaging_predict_prob(config: SimpleNamespace, df: pd.DataFrame) -> pd.DataFrame:
+    global _CACHED_MODEL, _CACHED_TRAINER
     experiment_dir, checkpoint_dir = assemble_experiment_path(config)
 
     _df = df.copy().set_index(config.index_column)
@@ -26,41 +30,48 @@ def imaging_predict_prob(config: SimpleNamespace, df: pd.DataFrame) -> pd.DataFr
         num_workers=config.num_workers,
     )
 
-    model_module = importlib.import_module("src.models")
-    model = getattr(model_module, config.model)(
-        num_labels=dataset.num_classes(),
-        lr=config.lr,
-    )
+    if _CACHED_MODEL is None:
+        print("🚀 First request: Loading 200MB model into RAM...")
+        checkpoints = list(checkpoint_dir.rglob("*.ckpt"))
+        if len(checkpoints) != 1:
+            raise ValueError(f"Expected 1 checkpoint, found {len(checkpoints)}")
+        best_checkpoint = checkpoints[0]
 
-    dataset.transform = model.preprocess
+        model_module = importlib.import_module("src.models")
+        model_class = getattr(model_module, config.model)
+        
+        # Load the heavy weights ONCE
+        _CACHED_MODEL = model_class.load_from_checkpoint(
+            best_checkpoint,
+            num_labels=dataset.num_classes(),
+            lr=config.lr,
+        )
+        _CACHED_MODEL.eval() # Lock the model for fast inference
 
-    trainer = Trainer(
-        default_root_dir=experiment_dir,
-        log_every_n_steps=1,
-        deterministic=True,
-    )
+        # Initialize the Trainer ONCE
+        _CACHED_TRAINER = Trainer(
+            default_root_dir=experiment_dir,
+            logger=False, # Disable logging to speed up API
+            deterministic=True,
+        )
 
-    checkpoints = list(checkpoint_dir.rglob("*.ckpt"))
-    if len(checkpoints) != 1:
-        raise ValueError(f"Expected 1 checkpoint, found {len(checkpoints)}")
-    best_checkpoint = checkpoints[0]
+    # 3. Use the globally cached model to preprocess the image
+    dataset.transform = _CACHED_MODEL.preprocess
 
-    # Evaluate the best model on the validation set
-    # [N, num_classes]
+    # 4. Predict using the cached model
+    print("⚡ Running fast inference...")
     prob_pred = torch.nn.functional.softmax(
         torch.cat(
-            trainer.predict(
-                model=model,
-                ckpt_path=best_checkpoint,
+            _CACHED_TRAINER.predict(
+                model=_CACHED_MODEL,
                 dataloaders=dataloader,
+                # CRITICAL: ckpt_path is REMOVED so it uses the memory, not the hard drive!
             )
         ),
         dim=-1,
     ).numpy()
 
     idx_to_class = dict((v, k) for k, v in dataset.class_to_idx.items())
-
-    # store probabilities in a csv file with the original index
     prob_columns = [idx_to_class[i] for i in range(prob_pred.shape[1])]
 
     return pd.DataFrame(

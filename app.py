@@ -3,7 +3,7 @@ import requests
 import os
 from PIL import Image
 
-N8N = "http://127.0.0.1:8000/predict"
+N8N = "https://skin-lesion-render.onrender.com/predict"
 
 st.set_page_config(page_title="Skin Lesion Triage", layout="wide")
 st.title("Skin Lesion Predictor")
